@@ -1,0 +1,3 @@
+# One branch name of origin per line, applied top to bottom.
+# Blank lines and # comments are ignored.
+feat/agents-opencode-config-dir
