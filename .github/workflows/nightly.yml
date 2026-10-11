@@ -29,15 +29,12 @@ jobs:
       base_sha: ${{ steps.meta.outputs.base_sha }}
       upstream_version: ${{ steps.meta.outputs.upstream_version }}
       gate_passed: ${{ steps.gate.outputs.passed }}
-      verdict: ${{ steps.baseline.outputs.verdict }}
+      # green | upstream red (tolerated) | patches red | upstream red | gate error
+      verdict: ${{ steps.gate.outputs.verdict }}
     env:
-      # Run in src/ (VALIDATE_CMD: once per patch; GATE_CMD: once on the final stack).
+      # Run in a source tree: once per patch by stack.sh, and as the gate's typecheck.
       VALIDATE_CMD: |
         for p in core cli tui; do (cd "packages/$p" && bun run typecheck) || exit 1; done
-      GATE_CMD: |
-        set -euo pipefail
-        for p in core cli tui; do (cd "packages/$p" && bun run typecheck); done
-        GITHUB_ACTIONS=false bun turbo test --filter=@opencode/core
     steps:
       - name: Checkout fork (ci/)
         uses: actions/checkout@v4
@@ -92,6 +89,13 @@ jobs:
       - name: Verify OpenCode
         run: opencode --version
 
+      # The core tests need a system `rg`: the test preload blocks the ripgrep download.
+      - name: Install ripgrep
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ripgrep
+          rg --version
+
       - name: Configure git identity
         run: |
           git config --global user.email "bot@opencode.ai"
@@ -129,28 +133,95 @@ jobs:
           retention-days: 3
           overwrite: true
 
-      - name: Gate (typecheck + core tests)
+      # Gate: typecheck must pass. Core tests may fail only where the same tests also fail on the
+      # upstream base commit ("no new failures vs upstream").
+      - name: Gate (typecheck + core tests vs upstream)
         id: gate
-        working-directory: src
-        run: |
-          bash -c "$GATE_CMD"
-          echo "passed=true" >> "$GITHUB_OUTPUT"
-
-      - name: Gate on clean upstream/dev (diagnose)
-        id: baseline
-        if: ${{ failure() && steps.gate.outcome == 'failure' }}
+        env:
+          BASE_SHA: ${{ steps.meta.outputs.base_sha }}
         run: |
           set +e
-          git -C src worktree add --detach "$GITHUB_WORKSPACE/upstream-clean" upstream/dev
-          cd "$GITHUB_WORKSPACE/upstream-clean"
-          if bun install --frozen-lockfile && bash -c "$GATE_CMD"; then
-            verdict="patches red"
-          else
-            verdict="upstream red"
+          set -o pipefail
+          out="$RUNNER_TEMP/gate"
+          mkdir -p "$out"
+          : >"$out/known-upstream-failures.txt"
+          clean="$GITHUB_WORKSPACE/upstream-clean"
+
+          finish() { # <passed> <verdict> <message>
+            echo "passed=$1" >>"$GITHUB_OUTPUT"
+            echo "verdict=$2" >>"$GITHUB_OUTPUT"
+            cp "$out/known-upstream-failures.txt" "$GITHUB_WORKSPACE/known-upstream-failures.txt"
+            printf '### Gate: %s\n\n%s\n' "$2" "$3" >>"$GITHUB_STEP_SUMMARY"
+            if [ "$1" = true ]; then
+              echo "Gate: $2"
+              exit 0
+            fi
+            echo "::error::Gate: $2: ${3%%$'\n'*}"
+            exit 1
+          }
+
+          setup_baseline() {
+            [ -d "$clean" ] && return 0
+            git -C src worktree add --detach "$clean" "$BASE_SHA" &&
+              (cd "$clean" && bun install --frozen-lockfile)
+          }
+
+          # Names of failing tests: exact `(fail) ` lines, timing stripped, unique.
+          fail_names() {
+            grep -a '^(fail) ' "$1" | sed -E 's/\r$//; s/^\(fail\) //; s/ \[[^]]*\]$//' | LC_ALL=C sort -u
+          }
+
+          # Runs core tests in <dir>; log to <log>, failing names to <log>.fail. Returns:
+          # 0 clean, 1 tests failed (names collected), 2 no usable result (crash, no summary,
+          # or a non-zero exit with no `(fail)` line).
+          run_tests() { # <dir> <log>
+            (cd "$1" && GITHUB_ACTIONS=false bun turbo test --force --log-prefix=none --filter=@opencode/core) 2>&1 | tee "$2"
+            local rc=${PIPESTATUS[0]}
+            grep -aqE '^Ran [0-9]+ tests' "$2" || return 2
+            fail_names "$2" >"$2.fail"
+            if [ -s "$2.fail" ]; then return 1; fi
+            [ "$rc" -eq 0 ] || return 2
+            return 0
+          }
+
+          if ! (cd src && bash -c "$VALIDATE_CMD"); then
+            # Typecheck never tolerates failures; the baseline only labels the cause.
+            if setup_baseline && (cd "$clean" && bash -c "$VALIDATE_CMD"); then
+              finish false "patches red" "Typecheck fails on the stack but passes on upstream."
+            fi
+            finish false "upstream red" "Typecheck fails on the stack and on upstream (or the baseline could not be set up)."
           fi
-          echo "verdict=$verdict" >> "$GITHUB_OUTPUT"
-          echo "Gate failed: $verdict" >> "$GITHUB_STEP_SUMMARY"
-          exit 0
+
+          run_tests src "$out/personal.log"
+          case $? in
+            0) finish true green "Typecheck and core tests pass." ;;
+            2) finish false "gate error" "Core tests on the stack produced no usable result (no summary line, or a failure with no failing test)." ;;
+          esac
+
+          if ! setup_baseline; then
+            finish false "gate error" "Could not set up the upstream baseline checkout."
+          fi
+          run_tests "$clean" "$out/upstream.log"
+          case $? in
+            2) finish false "gate error" "Core tests on upstream produced no usable result." ;;
+          esac
+          [ -f "$out/upstream.log.fail" ] || : >"$out/upstream.log.fail"
+
+          new=$(LC_ALL=C comm -23 "$out/personal.log.fail" "$out/upstream.log.fail")
+          LC_ALL=C comm -12 "$out/personal.log.fail" "$out/upstream.log.fail" >"$out/known-upstream-failures.txt"
+          if [ -n "$new" ]; then
+            finish false "patches red" "$(printf 'Tests failing only on the stack:\n\n%s\n' "$new")"
+          fi
+          finish true "upstream red (tolerated)" "$(printf 'All failing tests also fail on upstream/dev:\n\n%s\n' "$(cat "$out/known-upstream-failures.txt")")"
+
+      - name: Upload gate result
+        uses: actions/upload-artifact@v4
+        with:
+          name: gate
+          path: known-upstream-failures.txt
+          if-no-files-found: error
+          retention-days: 3
+          overwrite: true
 
       # Hidden dirs are skipped by upload-artifact, so ship the cache as a tarball.
       - name: Upload rerere cache
@@ -315,6 +386,9 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: stack-report
+      - uses: actions/download-artifact@v4
+        with:
+          name: gate
 
       - name: Sign and smoke test
         run: |
@@ -337,6 +411,7 @@ jobs:
           FORK_SHA: ${{ needs.publish.outputs.fork_sha }}
           BASE_SHA: ${{ needs.stack.outputs.base_sha }}
           UPSTREAM_VERSION: ${{ needs.stack.outputs.upstream_version }}
+          VERDICT: ${{ needs.stack.outputs.verdict }}
         run: |
           set -euo pipefail
           tag="v${UPSTREAM_VERSION}-jjj.${GITHUB_RUN_NUMBER}.${GITHUB_RUN_ATTEMPT}"
@@ -347,6 +422,16 @@ jobs:
             echo "| patch | status | source |"
             echo "| --- | --- | --- |"
             jq -r '.patches[] | "| `\(.branch)` | \(.status) | \(.source // "-") |"' stack-report.json
+            echo
+            echo "Gate: $VERDICT"
+            if [ -s known-upstream-failures.txt ]; then
+              echo
+              echo "### Known upstream failures"
+              echo
+              echo "These tests also fail on upstream/dev at the base commit; the gate tolerated them."
+              echo
+              sed 's/^/- /' known-upstream-failures.txt
+            fi
           } >notes.md
           gh release create "$tag" opencode-darwin-arm64.tar.gz \
             --target "$FORK_SHA" \

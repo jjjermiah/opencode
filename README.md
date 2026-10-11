@@ -26,7 +26,7 @@ Orphan branch holding only CI. A nightly workflow stacks personal patch branches
 ## Run
 
 - Nightly at 06:00 UTC, or manually: `gh workflow run nightly --ref fork`.
-- Green run: release `v<upstream version>-jjj.<run>.<attempt>` with `opencode-darwin-arm64.tar.gz`. Red run: issue `nightly failed`; the summary says `upstream red` or `patches red`.
+- Green run: release `v<upstream version>-jjj.<run>.<attempt>` with `opencode-darwin-arm64.tar.gz`. Gate: typecheck must pass; core tests may fail only where the same tests also fail on the upstream base (those are listed under "Known upstream failures" in the release notes). Red run: issue `nightly failed`; the summary says `patches red`, `upstream red` (typecheck) or `gate error` (test run produced no usable result).
 
 ## Schedule auto-disable
 
