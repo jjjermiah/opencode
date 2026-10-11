@@ -97,9 +97,9 @@ has_markers() { # conflict markers in tracked-file changes vs HEAD
 }
 
 REPORT='[]'
-add_report() { # <branch> <head> <status> <detail>
-  REPORT=$(jq -c --arg b "$1" --arg h "$2" --arg s "$3" --arg d "$4" \
-    '. + [{branch: $b, head: (if $h == "" then null else $h end), status: $s, detail: $d}]' \
+add_report() { # <branch> <head> <status> <detail> [<source>]
+  REPORT=$(jq -c --arg b "$1" --arg h "$2" --arg s "$3" --arg d "$4" --arg o "${5:-}" \
+    '. + [{branch: $b, head: (if $h == "" then null else $h end), source: (if $o == "" then null else $o end), status: $s, detail: $d}]' \
     <<<"$REPORT")
 }
 
@@ -211,6 +211,7 @@ for BRANCH in ${BRANCHES[@]+"${BRANCHES[@]}"}; do
     continue
   fi
 
+  source_sha=$(g rev-parse "origin/$BRANCH")
   before=$(g rev-parse HEAD)
   snapshot_cache
   REASON=''
@@ -246,15 +247,15 @@ for BRANCH in ${BRANCHES[@]+"${BRANCHES[@]}"}; do
     g reset -q --hard "$before"
     g clean -fdq
     restore_cache
-    add_report "$BRANCH" "" failed "$REASON"
+    add_report "$BRANCH" "" failed "$REASON" "$source_sha"
   elif [ "$picked" = 0 ]; then
-    add_report "$BRANCH" "$(g rev-parse HEAD)" empty "no commits to apply"
+    add_report "$BRANCH" "$(g rev-parse HEAD)" empty "no commits to apply" "$source_sha"
   elif [ "$USED_RESOLVER" = 1 ]; then
-    add_report "$BRANCH" "$(g rev-parse HEAD)" resolved "conflicts resolved by RESOLVE_CMD"
+    add_report "$BRANCH" "$(g rev-parse HEAD)" resolved "conflicts resolved by RESOLVE_CMD" "$source_sha"
   elif [ "$REPLAYED" = 1 ]; then
-    add_report "$BRANCH" "$(g rev-parse HEAD)" applied "applied (rerere replay)"
+    add_report "$BRANCH" "$(g rev-parse HEAD)" applied "applied (rerere replay)" "$source_sha"
   else
-    add_report "$BRANCH" "$(g rev-parse HEAD)" applied "applied cleanly"
+    add_report "$BRANCH" "$(g rev-parse HEAD)" applied "applied cleanly" "$source_sha"
   fi
 done
 

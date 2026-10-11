@@ -1,0 +1,396 @@
+name: nightly
+
+on:
+  schedule:
+    - cron: "0 6 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: nightly
+  cancel-in-progress: false
+
+# Least privilege: each job asks for what it needs. The job that runs the agent
+# and patch code (stack) can only read.
+permissions: {}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  # Runs the agent, patch code and builds. Read-only token; hands results to
+  # `publish` as artifacts.
+  stack:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    permissions:
+      contents: read
+    outputs:
+      base_sha: ${{ steps.meta.outputs.base_sha }}
+      upstream_version: ${{ steps.meta.outputs.upstream_version }}
+      gate_passed: ${{ steps.gate.outputs.passed }}
+      verdict: ${{ steps.baseline.outputs.verdict }}
+    env:
+      # Run in src/ (VALIDATE_CMD: once per patch; GATE_CMD: once on the final stack).
+      VALIDATE_CMD: |
+        for p in core cli tui; do (cd "packages/$p" && bun run typecheck) || exit 1; done
+      GATE_CMD: |
+        set -euo pipefail
+        for p in core cli tui; do (cd "packages/$p" && bun run typecheck); done
+        GITHUB_ACTIONS=false bun turbo test --filter=@opencode/core
+    steps:
+      - name: Checkout fork (ci/)
+        uses: actions/checkout@v4
+        with:
+          ref: fork
+          path: ci
+          persist-credentials: false
+
+      - name: Checkout source (src/)
+        uses: actions/checkout@v4
+        with:
+          path: src
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Add upstream remote
+        run: git -C src remote add upstream https://github.com/anomalyco/opencode.git
+
+      - name: Require git >= 2.45
+        run: |
+          git --version
+          v=$(git --version | awk '{print $3}')
+          if [ "$(printf '%s\n%s\n' "$v" 2.45 | sort -V | head -n1)" != "2.45" ]; then
+            echo "::error::git $v is older than 2.45 (stack.sh needs cherry-pick --empty=drop)"
+            exit 1
+          fi
+
+      # src/ is an orphan-branch checkout without package.json; read the Bun version from upstream.
+      - name: Resolve Bun version from upstream/dev
+        id: bunver
+        run: |
+          git -C src fetch -q upstream dev
+          bun=$(git -C src show FETCH_HEAD:package.json | jq -r '.packageManager | sub("^bun@"; "")')
+          echo "Bun $bun"
+          echo "version=$bun" >> "$GITHUB_OUTPUT"
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ steps.bunver.outputs.version }}
+
+      - name: Install OpenCode
+        run: |
+          curl -fsSL https://opencode.ai/v2/install | bash -s -- --no-modify-path
+          echo "$HOME/.opencode/bin" >> "$GITHUB_PATH"
+
+      - name: Verify OpenCode
+        run: opencode --version
+
+      - name: Configure git identity
+        run: |
+          git config --global user.email "bot@opencode.ai"
+          git config --global user.name "opencode"
+
+      - name: Stack patches onto upstream/dev
+        id: stack
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENCODE_DISABLE_AUTOUPDATE: "1"
+          # Only for stack.sh's merged-PR lookup; RESOLVE_CMD strips it before the agent starts.
+          GH_TOKEN: ${{ github.token }}
+          PREPARE_CMD: bun install --frozen-lockfile
+          RESOLVE_CMD: |-
+            env -u GH_TOKEN -u GITHUB_TOKEN timeout 20m opencode run --standalone --auto -m anthropic/claude-sonnet-5-5 "Branch: $PATCH_BRANCH. $(cat "$GITHUB_WORKSPACE/ci/prompts/resolve.md")"
+        run: |
+          # No stack-report.json on exit means the first PREPARE_CMD failed; the job fails here.
+          ci/scripts/stack.sh src
+
+      - name: Record base and upstream version
+        id: meta
+        run: |
+          base=$(jq -r .base stack-report.json)
+          version=$(git -C src show "$base:package.json" | jq -r .version)
+          echo "base_sha=$base" >> "$GITHUB_OUTPUT"
+          echo "upstream_version=$version" >> "$GITHUB_OUTPUT"
+
+      # Uploaded even on a red gate so `publish` can still sync patch-failure issues.
+      - name: Upload stack report
+        if: ${{ !cancelled() && hashFiles('stack-report.json') != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: stack-report
+          path: stack-report.json
+          retention-days: 3
+          overwrite: true
+
+      - name: Gate (typecheck + core tests)
+        id: gate
+        working-directory: src
+        run: |
+          bash -c "$GATE_CMD"
+          echo "passed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Gate on clean upstream/dev (diagnose)
+        id: baseline
+        if: ${{ failure() && steps.gate.outcome == 'failure' }}
+        run: |
+          set +e
+          git -C src worktree add --detach "$GITHUB_WORKSPACE/upstream-clean" upstream/dev
+          cd "$GITHUB_WORKSPACE/upstream-clean"
+          if bun install --frozen-lockfile && bash -c "$GATE_CMD"; then
+            verdict="patches red"
+          else
+            verdict="upstream red"
+          fi
+          echo "verdict=$verdict" >> "$GITHUB_OUTPUT"
+          echo "Gate failed: $verdict" >> "$GITHUB_STEP_SUMMARY"
+          exit 0
+
+      # Hidden dirs are skipped by upload-artifact, so ship the cache as a tarball.
+      - name: Upload rerere cache
+        run: tar -czf rr-cache.tgz -C ci .rr-cache
+
+      - name: Upload rerere cache artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rr-cache
+          path: rr-cache.tgz
+          if-no-files-found: error
+          retention-days: 3
+          overwrite: true
+
+      - name: Build opencode-darwin-arm64
+        working-directory: src
+        env:
+          OPENCODE_CHANNEL: jjj
+          GH_TOKEN: ${{ github.token }}
+          BUN_VERSION: ${{ steps.bunver.outputs.version }}
+        run: |
+          export OPENCODE_VERSION="0.0.0-jjj-$GITHUB_RUN_NUMBER"
+          export BUN_COMPILE_RELEASE="bun-v$BUN_VERSION"
+          bun packages/cli/script/build.ts --target=opencode-darwin-arm64
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: opencode-darwin-arm64
+          path: src/packages/cli/dist/cli-darwin-arm64/bin/opencode
+          if-no-files-found: error
+          retention-days: 3
+          overwrite: true
+
+  # No agent, no patch code. Holds the write token: issues and .rr-cache pushes to `fork`.
+  publish:
+    needs: stack
+    if: ${{ !cancelled() && needs.stack.result != 'skipped' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      issues: write
+    outputs:
+      fork_sha: ${{ steps.rrcache.outputs.fork_sha }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Checkout fork (ci/)
+        uses: actions/checkout@v4
+        with:
+          ref: fork
+          path: ci
+
+      # `pattern` (unlike `name`) does not fail when the artifact was never uploaded.
+      - name: Download stack report
+        uses: actions/download-artifact@v4
+        with:
+          pattern: stack-report
+          path: report
+          merge-multiple: true
+
+      - name: Download rerere cache
+        uses: actions/download-artifact@v4
+        with:
+          pattern: rr-cache
+          path: rr
+          merge-multiple: true
+
+      - name: Open and close patch-failure issues
+        run: |
+          set -euo pipefail
+          report=report/stack-report.json
+          if [ ! -f "$report" ]; then
+            echo "No stack report; skipping issue sync."
+            exit 0
+          fi
+          run_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          gh label create patch-failure --color B60205 --description "Nightly fork automation failure" </dev/null 2>/dev/null || true
+          open=$(gh issue list --label patch-failure --state open --limit 200 --json number,title </dev/null)
+          while IFS=$'\t' read -r branch status detail; do
+            title="patch failed: $branch"
+            number=$(jq -r --arg t "$title" '[.[] | select(.title == $t)][0].number // empty' <<<"$open")
+            case "$status" in
+              failed)
+                body=$(printf 'Patch %s failed to apply onto upstream/dev.\n\n%s\n\nRun: %s\n' "$branch" "$detail" "$run_url")
+                if [ -n "$number" ]; then
+                  gh issue edit "$number" --body "$body" </dev/null
+                else
+                  gh issue create --title "$title" --label patch-failure --body "$body" </dev/null
+                fi
+                ;;
+              applied | resolved | merged | empty)
+                if [ -n "$number" ]; then
+                  gh issue close "$number" --comment "Patch is now \`$status\` ($run_url)." </dev/null
+                fi
+                ;;
+            esac
+          done < <(jq -r '.patches[] | [.branch, .status, .detail] | @tsv' "$report")
+          # Branches dropped from patches.txt: close their leftover issues.
+          while IFS=$'\t' read -r number branch; do
+            gh issue close "$number" --comment "Branch is no longer in patches.txt ($run_url)." </dev/null
+          done < <(jq -r --slurpfile r "$report" '
+            ($r[0].patches | map(.branch)) as $known
+            | .[] | select(.title | startswith("patch failed: "))
+            | (.title | ltrimstr("patch failed: ")) as $b
+            | select($known | index($b) | not)
+            | [.number, $b] | @tsv' <<<"$open")
+
+      # Gate passed: persist new rerere resolutions. Only .rr-cache is committed; no upstream commits are pushed.
+      - name: Commit .rr-cache to fork
+        id: rrcache
+        working-directory: ci
+        env:
+          GATE_PASSED: ${{ needs.stack.outputs.gate_passed }}
+        run: |
+          set -euo pipefail
+          if [ "$GATE_PASSED" = "true" ] && [ -f ../rr/rr-cache.tgz ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            # The archive comes from the agent's job: accept only plain files and dirs under .rr-cache/.
+            if ! tar -tzvf ../rr/rr-cache.tgz | awk '$1 !~ /^[-d]/ || $NF !~ /^\.rr-cache(\/|$)/ {bad=1} END {exit bad}'; then
+              echo "::error::rr-cache archive has unexpected entries; not committing it"
+              exit 1
+            fi
+            tar -xzf ../rr/rr-cache.tgz --no-same-owner
+            git add -A .rr-cache
+            if ! git diff --cached --quiet; then
+              git commit -q -m "chore: update rerere cache"
+              pushed=0
+              for attempt in 1 2; do
+                if git fetch -q origin fork && git rebase -q FETCH_HEAD && git push -q origin HEAD:refs/heads/fork; then
+                  pushed=1
+                  break
+                fi
+                echo "push attempt $attempt failed"
+                git rebase --abort 2>/dev/null || true
+                sleep 5
+              done
+              [ "$pushed" = 1 ] || { echo "::error::could not push .rr-cache to fork"; exit 1; }
+            fi
+          fi
+          echo "fork_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+  release:
+    needs: [stack, publish]
+    runs-on: macos-15
+    timeout-minutes: 20
+    permissions:
+      contents: write
+      issues: write
+    env:
+      OPENCODE_DISABLE_AUTOUPDATE: "1"
+      OPENCODE_DISABLE_CHANNEL_DB: "1"
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: opencode-darwin-arm64
+      - uses: actions/download-artifact@v4
+        with:
+          name: stack-report
+
+      - name: Sign and smoke test
+        run: |
+          set -euo pipefail
+          chmod +x opencode
+          codesign --force --sign - opencode
+          codesign --verify --verbose opencode
+          version=$(./opencode --version)
+          echo "$version"
+          case "$version" in
+            *"0.0.0-jjj-$GITHUB_RUN_NUMBER"*) ;;
+            *)
+              echo "::error::expected 0.0.0-jjj-$GITHUB_RUN_NUMBER in --version output"
+              exit 1
+              ;;
+          esac
+
+      - name: Package and release
+        env:
+          FORK_SHA: ${{ needs.publish.outputs.fork_sha }}
+          BASE_SHA: ${{ needs.stack.outputs.base_sha }}
+          UPSTREAM_VERSION: ${{ needs.stack.outputs.upstream_version }}
+        run: |
+          set -euo pipefail
+          tag="v${UPSTREAM_VERSION}-jjj.${GITHUB_RUN_NUMBER}.${GITHUB_RUN_ATTEMPT}"
+          tar -czf opencode-darwin-arm64.tar.gz opencode
+          {
+            echo "Upstream: anomalyco/opencode@$BASE_SHA"
+            echo
+            echo "| patch | status | source |"
+            echo "| --- | --- | --- |"
+            jq -r '.patches[] | "| `\(.branch)` | \(.status) | \(.source // "-") |"' stack-report.json
+          } >notes.md
+          gh release create "$tag" opencode-darwin-arm64.tar.gz \
+            --target "$FORK_SHA" \
+            --title "$tag" \
+            --notes-file notes.md
+          echo "TAG=$tag" >> "$GITHUB_ENV"
+
+      - name: Close "nightly failed" issue
+        run: |
+          set -euo pipefail
+          release_url=$(gh release view "$TAG" --json url --jq .url)
+          number=$(gh issue list --label patch-failure --state open --limit 200 --json number,title \
+            | jq -r '[.[] | select(.title == "nightly failed")][0].number // empty')
+          if [ -n "$number" ]; then
+            gh issue close "$number" --comment "Fixed by release $release_url"
+          fi
+
+  notify:
+    needs: [stack, publish, release]
+    if: ${{ always() && (contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      issues: write
+    steps:
+      - name: Open or update "nightly failed" issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          STACK_RESULT: ${{ needs.stack.result }}
+          PUBLISH_RESULT: ${{ needs.publish.result }}
+          RELEASE_RESULT: ${{ needs.release.result }}
+          VERDICT: ${{ needs.stack.outputs.verdict }}
+        run: |
+          set -euo pipefail
+          run_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          title="nightly failed"
+          body=$(printf 'Nightly run failed: %s\n\nstack: %s\npublish: %s\nrelease: %s\ngate verdict: %s\n' \
+            "$run_url" "$STACK_RESULT" "$PUBLISH_RESULT" "$RELEASE_RESULT" "${VERDICT:-n/a}")
+          gh label create patch-failure --color B60205 --description "Nightly fork automation failure" 2>/dev/null || true
+          number=$(gh issue list --label patch-failure --state open --limit 200 --json number,title \
+            | jq -r --arg t "$title" '[.[] | select(.title == $t)][0].number // empty')
+          if [ -n "$number" ]; then
+            gh issue edit "$number" --body "$body"
+          else
+            gh issue create --title "$title" --label patch-failure --body "$body"
+          fi
