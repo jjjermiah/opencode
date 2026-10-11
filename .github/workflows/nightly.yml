@@ -166,21 +166,30 @@ jobs:
               (cd "$clean" && bun install --frozen-lockfile)
           }
 
-          # Names of failing tests: exact `(fail) ` lines, timing stripped, unique.
+          # Failing tests as `file > name`, unique. bun prints `<path>:` at column 0 before a
+          # file's results and `(fail) <name> [<time>]` per failing test (exact prefix only).
           fail_names() {
-            grep -a '^(fail) ' "$1" | sed -E 's/\r$//; s/^\(fail\) //; s/ \[[^]]*\]$//' | LC_ALL=C sort -u
+            awk '
+              { sub(/\r$/, "") }
+              /^[^[:space:]]+\.[cm]?[jt]sx?:$/ { file = substr($0, 1, length($0) - 1); next }
+              /^\(fail\) / {
+                name = substr($0, 8)
+                sub(/ \[[^]]*\]$/, "", name)
+                print (file != "" ? file " > " : "") name
+              }' "$1" | LC_ALL=C sort -u
           }
 
-          # Runs core tests in <dir>; log to <log>, failing names to <log>.fail. Returns:
-          # 0 clean, 1 tests failed (names collected), 2 no usable result (crash, no summary,
-          # or a non-zero exit with no `(fail)` line).
+          # Runs core tests in <dir>; log to <log>, failing names to <log>.fail. Sets RC, RAN (tests
+          # run), ERR (bun's `N error(s)`: load errors and errors between tests, which print no
+          # `(fail)` line). Returns 2 when there is no `Ran N tests` summary (crash).
           run_tests() { # <dir> <log>
             (cd "$1" && GITHUB_ACTIONS=false bun turbo test --force --log-prefix=none --filter=@opencode/core) 2>&1 | tee "$2"
-            local rc=${PIPESTATUS[0]}
-            grep -aqE '^Ran [0-9]+ tests' "$2" || return 2
+            RC=${PIPESTATUS[0]}
+            RAN=$(grep -aE '^Ran [0-9]+ tests? across [0-9]+ files?' "$2" | tail -n1 | sed -E 's/^Ran ([0-9]+) tests?.*/\1/')
+            [ -n "$RAN" ] || return 2
+            ERR=$(grep -aE '^ *[0-9]+ errors?\r?$' "$2" | tail -n1 | tr -dc '0-9')
+            ERR=${ERR:-0}
             fail_names "$2" >"$2.fail"
-            if [ -s "$2.fail" ]; then return 1; fi
-            [ "$rc" -eq 0 ] || return 2
             return 0
           }
 
@@ -193,24 +202,45 @@ jobs:
           fi
 
           run_tests src "$out/personal.log"
-          case $? in
-            0) finish true green "Typecheck and core tests pass." ;;
-            2) finish false "gate error" "Core tests on the stack produced no usable result (no summary line, or a failure with no failing test)." ;;
-          esac
+          if [ $? -eq 2 ]; then
+            finish false "gate error" "Core tests on the stack printed no summary line (crash)."
+          fi
+          rc_p=$RC ran_p=$RAN err_p=$ERR
+          if [ ! -s "$out/personal.log.fail" ]; then
+            if [ "$err_p" -gt 0 ]; then
+              finish false "patches red" "Core tests on the stack report $err_p error(s) (e.g. a test file that fails to load) and no failing test names."
+            fi
+            if [ "$rc_p" -ne 0 ]; then
+              finish false "gate error" "Core tests on the stack exited $rc_p with no failing test and no error count."
+            fi
+            finish true green "Typecheck and core tests pass."
+          fi
 
           if ! setup_baseline; then
             finish false "gate error" "Could not set up the upstream baseline checkout."
           fi
           run_tests "$clean" "$out/upstream.log"
-          case $? in
-            2) finish false "gate error" "Core tests on upstream produced no usable result." ;;
-          esac
-          [ -f "$out/upstream.log.fail" ] || : >"$out/upstream.log.fail"
+          if [ $? -eq 2 ]; then
+            finish false "gate error" "Core tests on upstream printed no summary line (crash)."
+          fi
+          if [ ! -s "$out/upstream.log.fail" ] && [ "$RC" -ne 0 ] && [ "$ERR" -eq 0 ]; then
+            finish false "gate error" "Core tests on upstream exited $RC with no failing test and no error count."
+          fi
 
           new=$(LC_ALL=C comm -23 "$out/personal.log.fail" "$out/upstream.log.fail")
           LC_ALL=C comm -12 "$out/personal.log.fail" "$out/upstream.log.fail" >"$out/known-upstream-failures.txt"
           if [ -n "$new" ]; then
             finish false "patches red" "$(printf 'Tests failing only on the stack:\n\n%s\n' "$new")"
+          fi
+          if [ "$err_p" -gt "$ERR" ]; then
+            finish false "patches red" "The stack has more test errors than upstream ($err_p vs $ERR), e.g. a file that fails to load."
+          fi
+          if [ "$ran_p" -lt "$RAN" ]; then
+            finish false "patches red" "The stack ran fewer tests than upstream ($ran_p vs $RAN)."
+          fi
+          inherited=$(wc -l <"$out/known-upstream-failures.txt" | tr -d ' ')
+          if [ "$inherited" -gt 10 ]; then
+            finish false "gate error" "upstream baseline too red to gate ($inherited failing tests inherited from upstream)."
           fi
           finish true "upstream red (tolerated)" "$(printf 'All failing tests also fail on upstream/dev:\n\n%s\n' "$(cat "$out/known-upstream-failures.txt")")"
 
@@ -430,7 +460,7 @@ jobs:
               echo
               echo "These tests also fail on upstream/dev at the base commit; the gate tolerated them."
               echo
-              sed 's/^/- /' known-upstream-failures.txt
+              while IFS= read -r name; do printf -- '- \x60%s\x60\n' "$name"; done <known-upstream-failures.txt
             fi
           } >notes.md
           gh release create "$tag" opencode-darwin-arm64.tar.gz \
