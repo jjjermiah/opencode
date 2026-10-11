@@ -351,6 +351,7 @@ jobs:
           gh release create "$tag" opencode-darwin-arm64.tar.gz \
             --target "$FORK_SHA" \
             --title "$tag" \
+            --latest \
             --notes-file notes.md
           echo "TAG=$tag" >> "$GITHUB_ENV"
 

@@ -130,8 +130,10 @@ pick_commit() { # <sha>
     fi
     log "conflict at $sha, running RESOLVE_CMD"
     USED_RESOLVER=1
-    if ! PATCH_BRANCH=$BRANCH run_in_src "$RESOLVE_CMD" >&2; then
-      REASON="RESOLVE_CMD failed at $sha"
+    local rc=0
+    PATCH_BRANCH=$BRANCH run_in_src "$RESOLVE_CMD" >&2 || rc=$?
+    if [ "$rc" -ne 0 ]; then
+      REASON="RESOLVE_CMD failed at $sha (exit $rc$([ "$rc" -eq 124 ] && echo ', timed out'))"
       return 1
     fi
     if ! pick_in_progress; then
@@ -168,10 +170,14 @@ pick_commit() { # <sha>
 }
 
 merged_pr() { # <branch>; prints PR number if merged upstream from MERGED_OWNER
-  gh pr list --repo anomalyco/opencode --head "$1" --state merged \
-    --json number,headRepositoryOwner 2>/dev/null |
-    jq -r --arg o "$MERGED_OWNER" \
-      '[.[] | select((.headRepositoryOwner.login // "" | ascii_downcase) == $o)][0].number // empty' ||
+  local json
+  if ! json=$(gh pr list --repo anomalyco/opencode --head "$1" --state merged \
+    --json number,headRepositoryOwner 2>&1); then
+    log "gh pr list failed for $1 (treating as not merged): $(tail_msg "$json")"
+    return 0
+  fi
+  jq -r --arg o "$MERGED_OWNER" \
+    '[.[] | select((.headRepositoryOwner.login // "" | ascii_downcase) == $o)][0].number // empty' <<<"$json" ||
     true
 }
 

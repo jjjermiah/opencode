@@ -31,3 +31,10 @@ Orphan branch holding only CI. A nightly workflow stacks personal patch branches
 ## Schedule auto-disable
 
 GitHub disables scheduled workflows after 60 days without repo activity. Re-enable: `gh workflow enable nightly`, or Actions tab → nightly → Enable workflow. Repo activity such as a push to `fork` should reset the timer (unverified for manual dispatch).
+
+## On the Mac
+
+- Install with `opencode-fork update` from a plain terminal (it refuses inside an OpenCode session).
+- Don't launch OpenCode.app while on the fork: it starts its own prod service on the same `opencode.db`, and its "Install CLI" button overwrites the fork binary.
+- The `jjj` channel uses its own service file, password and port, so clients pinned to the old port or password must reconnect once.
+- Fresh Mac: run `mkdir -p ~/Library/LaunchAgents` before the first `dotfiles-stow`, or stow folds the whole directory into the repo.
