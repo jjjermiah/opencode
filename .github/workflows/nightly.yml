@@ -269,13 +269,16 @@ jobs:
       - name: Build opencode-darwin-arm64
         working-directory: src
         env:
-          OPENCODE_CHANNEL: jjj
+          # Channel `latest` shares service.json, the default port and opencode.db with the official
+          # desktop app, so the app and the fork TUI talk to one server.
+          OPENCODE_CHANNEL: latest
           GH_TOKEN: ${{ github.token }}
           BUN_VERSION: ${{ steps.bunver.outputs.version }}
           UPSTREAM_VERSION: ${{ steps.meta.outputs.upstream_version }}
         run: |
-          # Same version as upstream's release plus a fork suffix, so `opencode --version` reads like the live one.
-          export OPENCODE_VERSION="${UPSTREAM_VERSION}-jjj.${GITHUB_RUN_NUMBER}"
+          # Same version string as upstream's release: the official app and the fork then accept each
+          # other's server instead of replacing it. The run number lives in the release tag only.
+          export OPENCODE_VERSION="${UPSTREAM_VERSION}"
           export BUN_COMPILE_RELEASE="bun-v$BUN_VERSION"
           bun packages/cli/script/build.ts --target=opencode-darwin-arm64
 
@@ -433,9 +436,9 @@ jobs:
           version=$(./opencode --version)
           echo "$version"
           case "$version" in
-            *"${UPSTREAM_VERSION}-jjj.$GITHUB_RUN_NUMBER"*) ;;
+            *"${UPSTREAM_VERSION}"*) ;;
             *)
-              echo "::error::expected ${UPSTREAM_VERSION}-jjj.$GITHUB_RUN_NUMBER in --version output"
+              echo "::error::expected ${UPSTREAM_VERSION} in --version output"
               exit 1
               ;;
           esac

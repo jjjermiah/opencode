@@ -35,6 +35,6 @@ GitHub disables scheduled workflows after 60 days without repo activity. Re-enab
 ## On the Mac
 
 - Install with `opencode-fork update` from a plain terminal (it refuses inside an OpenCode session).
-- Don't launch OpenCode.app while on the fork: it starts its own prod service on the same `opencode.db`, and its "Install CLI" button overwrites the fork binary.
-- The `jjj` channel uses its own service file, password and port, so clients pinned to the old port or password must reconnect once.
+- The fork builds on channel `latest` and reports the plain upstream version (e.g. `2.0.29`; the run number lives only in the release tag, and `update` records it in `~/.local/state/opencode-fork/installed-tag`). It shares `service.json`, port 49374 and `opencode.db` with OpenCode.app, so the app and the fork TUI talk to one server.
+- OpenCode.app's "Install CLI" button overwrites the fork binary. When upstream releases a newer version than the fork binary, the app's bundled CLI may replace the shared server until the next nightly catches up; the autoupdater stays off (`update: disable`, `OPENCODE_DISABLE_AUTOUPDATE=1`).
 - Fresh Mac: run `mkdir -p ~/Library/LaunchAgents` before the first `dotfiles-stow`, or stow folds the whole directory into the repo.
