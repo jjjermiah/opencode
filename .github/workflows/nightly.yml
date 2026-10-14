@@ -272,8 +272,10 @@ jobs:
           OPENCODE_CHANNEL: jjj
           GH_TOKEN: ${{ github.token }}
           BUN_VERSION: ${{ steps.bunver.outputs.version }}
+          UPSTREAM_VERSION: ${{ steps.meta.outputs.upstream_version }}
         run: |
-          export OPENCODE_VERSION="0.0.0-jjj-$GITHUB_RUN_NUMBER"
+          # Same version as upstream's release plus a fork suffix, so `opencode --version` reads like the live one.
+          export OPENCODE_VERSION="${UPSTREAM_VERSION}-jjj.${GITHUB_RUN_NUMBER}"
           export BUN_COMPILE_RELEASE="bun-v$BUN_VERSION"
           bun packages/cli/script/build.ts --target=opencode-darwin-arm64
 
@@ -421,6 +423,8 @@ jobs:
           name: gate
 
       - name: Sign and smoke test
+        env:
+          UPSTREAM_VERSION: ${{ needs.stack.outputs.upstream_version }}
         run: |
           set -euo pipefail
           chmod +x opencode
@@ -429,9 +433,9 @@ jobs:
           version=$(./opencode --version)
           echo "$version"
           case "$version" in
-            *"0.0.0-jjj-$GITHUB_RUN_NUMBER"*) ;;
+            *"${UPSTREAM_VERSION}-jjj.$GITHUB_RUN_NUMBER"*) ;;
             *)
-              echo "::error::expected 0.0.0-jjj-$GITHUB_RUN_NUMBER in --version output"
+              echo "::error::expected ${UPSTREAM_VERSION}-jjj.$GITHUB_RUN_NUMBER in --version output"
               exit 1
               ;;
           esac
